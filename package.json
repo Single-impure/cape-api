@@ -1,0 +1,17 @@
+{
+  "name": "obscure-capes-api",
+  "version": "1.0.0",
+  "description": "API + site de capas do Obscure client",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "pg": "^8.13.1"
+  }
+}
