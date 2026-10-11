@@ -4,11 +4,16 @@
  * Relay WebSocket para os jogos multiplayer do client (PingPong 1v1 e Football).
  *
  * Uma "sala" = jogo + servidor Minecraft (ex.: "pingpong|play.exemplo.com").
- * Cada sala tem no maximo UM "campo" aberto (mesa / gol): o dono ("owner") roda
- * a fisica e as regras e manda o estado. Os outros clients da sala veem tudo e
- * mandam acoes ao dono:
- *   - pingpong: so o convidado (join) manda "hit"; os demais sao espectadores.
- *   - football: qualquer cliente manda "kick" / "place"; o dono avisa "goal" a todos.
+ *
+ * pingpong: cada sala tem no maximo UMA mesa; o dono roda a fisica e as regras e manda o
+ *   estado; so o convidado (join) manda "hit"; os demais sao espectadores.
+ *
+ * football ("world"): cada jogador pode ter 1 gol e 1 bola na sala.
+ *   - gset/gdel : o jogador cria/remove o proprio gol (o servidor guarda e repassa).
+ *   - ball      : o DONO da bola simula a fisica e manda o estado (o servidor guarda e repassa).
+ *   - kick/hold : qualquer jogador interage com a bola de outro; vai so ao dono da bola.
+ *   - gscore    : o dono da bola avisa a todos que fez gol (confete + mensagem).
+ *   - gone      : o servidor avisa quando alguem sai (some o gol e a bola dele).
  *
  * O servidor NAO simula nada: valida formato/faixas e repassa as mensagens.
  */
@@ -37,36 +42,45 @@ const HIT_SPEC = { au: [-60, 60], av: [-60, 60], sp: [0, 60] };
 // football
 const GOAL_SPEC = {
   ox: [-3e7, 3e7], oz: [-3e7, 3e7], fx: [-1.01, 1.01], fz: [-1.01, 1.01],
-  fy: [-64, 512], dim: [-10, 10], gw: [1, 30], gh: [1, 10], gd: [0.5, 10], br: [0.04, 0.6],
+  fy: [-64, 512], dim: [-10, 10], gw: [1, 30], gh: [1, 10], gd: [0.5, 10],
 };
 const BALL_SPEC = {
   bx: [-3e7, 3e7], by: [-100, 600], bz: [-3e7, 3e7],
-  vx: [-200, 200], vy: [-200, 200], vz: [-200, 200], on: [0, 1], gl: [0, 9999],
+  vx: [-200, 200], vy: [-200, 200], vz: [-200, 200],
+  on: [0, 1], dim: [-10, 10], br: [0.04, 0.6],
 };
-const KICK_SPEC = {
-  dx: [-1.5, 1.5], dy: [-1.5, 1.5], dz: [-1.5, 1.5], sp: [0, 60],
-  ex: [-3e7, 3e7], ey: [-100, 600], ez: [-3e7, 3e7],
+const KICK_SPEC = { dx: [-2, 2], dy: [-2, 2], dz: [-2, 2], sp: [0, 60] };
+const HOLD_SPEC = { on: [0, 1], tx: [-3e7, 3e7], ty: [-100, 600], tz: [-3e7, 3e7] };
+const SCORE_SPEC = { gx: [-3e7, 3e7], gy: [-100, 600], gz: [-3e7, 3e7] };
+
+// volei (uma quadra por sala; o dono simula a bola e as regras, igual ao pingpong)
+const COURT_SPEC = {
+  ox: [-3e7, 3e7], oz: [-3e7, 3e7], fx: [-1.01, 1.01], fz: [-1.01, 1.01],
+  fy: [-64, 512], dim: [-10, 10], cw: [2, 20], hl: [2, 20], nh: [0.5, 4], br: [0.04, 0.6],
 };
-const PLACE_SPEC = { px: [-3e7, 3e7], py: [-100, 600], pz: [-3e7, 3e7] };
-const GOALEV_SPEC = { gx: [-3e7, 3e7], gy: [-100, 600], gz: [-3e7, 3e7], n: [0, 9999] };
+const VSTATE_SPEC = {
+  bx: [-3e7, 3e7], by: [-100, 600], bz: [-3e7, 3e7],
+  vx: [-200, 200], vy: [-200, 200], vz: [-200, 200],
+  ph: [0, 3], sa: [0, 99], sb: [0, 99], sv: [0, 1], lt: [-1, 1], tc: [0, 9], pt: [-1, 1], rs: [0, 9],
+};
+const VHIT_SPEC = { dx: [-2, 2], dy: [-2, 2], dz: [-2, 2], sp: [0, 60], px: [-3e7, 3e7], pz: [-3e7, 3e7] };
 
 /**
  * Config por jogo:
- *  open/state   - campos aceitos ao abrir o campo / no estado do dono
- *  guestMode    - true: existe 1 convidado (join/leave) e so ele manda toOwner
- *  toOwner      - mensagens que os clients mandam so ao dono (o servidor anexa "from")
- *  events       - mensagens que o dono manda a todos (o servidor valida "who")
+ *  open/state   - (mesa) campos aceitos ao abrir a mesa / no estado do dono
+ *  guestMode    - (mesa) true: existe 1 convidado (join/leave) e so ele manda toOwner
+ *  toOwner      - (mesa) mensagens que os clients mandam so ao dono (o servidor anexa "from")
+ *  world        - true: jogo sem dono unico (cada jogador tem seu gol e sua bola)
  */
 const GAMES = {
   pingpong: { open: TABLE_SPEC, state: STATE_SPEC, guestMode: true, toOwner: { hit: HIT_SPEC }, events: {} },
-  football: {
-    open: GOAL_SPEC, state: BALL_SPEC, guestMode: false,
-    toOwner: { kick: KICK_SPEC, place: PLACE_SPEC }, events: { goal: GOALEV_SPEC },
-  },
+  football: { world: true },
+  volei: { open: COURT_SPEC, state: VSTATE_SPEC, guestMode: false, toOwner: { hit: VHIT_SPEC }, events: {} },
 };
 const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 
 const isNum = (v, min, max) => typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max;
+const okName = (v) => (typeof v === 'string' && NAME_RE.test(v) ? v : '');
 
 /** Copia so as chaves da spec; devolve null se alguma faltar ou estiver fora da faixa. */
 function pick(msg, spec) {
@@ -80,7 +94,7 @@ function pick(msg, spec) {
 
 function attach(httpServer) {
   const wss = new WebSocketServer({ server: httpServer, path: '/ws', maxPayload: 2048 });
-  const rooms = new Map(); // key -> { clients: Set<ws>, table: null | { owner, guest, data } }
+  const rooms = new Map(); // key -> { clients: Set<ws>, table, world }
   const perIp = new Map();
   let nextId = 1;
 
@@ -93,6 +107,13 @@ function attach(httpServer) {
     for (const c of room.clients) {
       if (c !== except && c.readyState === 1) c.send(text);
     }
+  };
+
+  const findClient = (room, name) => {
+    for (const c of room.clients) {
+      if (c.meta && c.meta.name === name) return c;
+    }
+    return null;
   };
 
   const tableInfo = (room) => {
@@ -123,6 +144,11 @@ function attach(httpServer) {
         broadcast(room, { t: 'left', owner: room.table.owner.meta.name });
       }
     }
+    if (room.world) {
+      const g = room.world.goals.delete(ws.meta.name);
+      const b = room.world.balls.delete(ws.meta.name);
+      if (g || b) broadcast(room, { t: 'gone', who: ws.meta.name });
+    }
     if (room.clients.size === 0) rooms.delete(ws.meta.key);
   }
 
@@ -137,7 +163,7 @@ function attach(httpServer) {
     const key = `${game}|${roomName.toLowerCase()}`;
     let room = rooms.get(key);
     if (!room) {
-      room = { clients: new Set(), table: null };
+      room = { clients: new Set(), table: null, world: GAMES[game].world ? { goals: new Map(), balls: new Map() } : null };
       rooms.set(key, room);
     }
     // mesma pessoa reconectando: derruba a conexao antiga
@@ -147,9 +173,63 @@ function attach(httpServer) {
         c.terminate();
       }
     }
+    // o cleanup pode ter removido a sala (ficou vazia): registra de novo
+    if (!rooms.has(key)) rooms.set(key, room);
+
     ws.meta = { name, key, id: String(nextId++), game, dead: false };
     room.clients.add(ws);
     send(ws, { t: 'welcome', id: ws.meta.id, n: room.clients.size, ...tableInfo(room) });
+
+    // football: manda a quem entrou os gols e as bolas que ja existem
+    if (room.world) {
+      for (const [n, d] of room.world.goals) send(ws, { t: 'gset', who: n, ...d });
+      for (const [n, d] of room.world.balls) send(ws, { t: 'ball', who: n, ...d });
+    }
+  }
+
+  /** Football: gol e bola por jogador. */
+  function onWorldMessage(ws, room, msg) {
+    const name = ws.meta.name;
+    const w = room.world;
+
+    switch (msg.t) {
+      case 'gset': {
+        const d = pick(msg, GOAL_SPEC);
+        if (!d || Math.abs(d.fx * d.fx + d.fz * d.fz - 1) > 0.05) return send(ws, { t: 'error', m: 'gol-invalido' });
+        w.goals.set(name, d);
+        return broadcast(room, { t: 'gset', who: name, ...d }, ws);
+      }
+
+      case 'gdel':
+        if (w.goals.delete(name)) broadcast(room, { t: 'gdel', who: name }, ws);
+        return;
+
+      case 'ball': {
+        const d = pick(msg, BALL_SPEC);
+        if (!d) return;
+        w.balls.set(name, d);
+        return broadcast(room, { t: 'ball', who: name, ...d }, ws);
+      }
+
+      case 'kick':
+      case 'hold': {
+        const target = typeof msg.to === 'string' && NAME_RE.test(msg.to) ? findClient(room, msg.to) : null;
+        if (!target || target === ws) return;
+        const d = pick(msg, msg.t === 'kick' ? KICK_SPEC : HOLD_SPEC);
+        if (d) send(target, { t: msg.t, from: name, ...d });
+        return;
+      }
+
+      case 'gscore': {
+        const d = pick(msg, SCORE_SPEC);
+        if (!d) return;
+        broadcast(room, { t: 'gscore', who: name, by: okName(msg.by), gown: okName(msg.gown), ...d }, ws);
+        return;
+      }
+
+      default:
+        return;
+    }
   }
 
   function onMessage(ws, msg) {
@@ -157,10 +237,10 @@ function attach(httpServer) {
     if (!room) return;
     const cfg = GAMES[ws.meta.game];
 
-    switch (msg.t) {
-      case 'ping':
-        return send(ws, { t: 'pong' });
+    if (msg.t === 'ping') return send(ws, { t: 'pong' });
+    if (cfg.world) return onWorldMessage(ws, room, msg);
 
+    switch (msg.t) {
       case 'open': {
         if (room.table) return send(ws, { t: 'error', m: 'mesa-ja-aberta', ...tableInfo(room) });
         const data = pick(msg, cfg.open);
@@ -201,22 +281,13 @@ function attach(httpServer) {
       }
 
       default: {
-        // acao de um cliente para o dono (hit / kick / place)
+        // acao de um cliente para o dono (hit)
         if (has(cfg.toOwner, msg.t)) {
           const tb = room.table;
           if (!tb || tb.owner === ws) return;
           if (cfg.guestMode && tb.guest !== ws) return;
           const d = pick(msg, cfg.toOwner[msg.t]);
           if (d) send(tb.owner, { t: msg.t, ...d, from: ws.meta.name });
-          return;
-        }
-        // evento do dono para todos (goal)
-        if (has(cfg.events, msg.t)) {
-          if (!room.table || room.table.owner !== ws) return;
-          const d = pick(msg, cfg.events[msg.t]);
-          if (!d) return;
-          const who = typeof msg.who === 'string' && NAME_RE.test(msg.who) ? msg.who : '';
-          broadcast(room, { t: msg.t, ...d, who }, ws);
         }
         return;
       }
