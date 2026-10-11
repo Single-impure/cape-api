@@ -224,4 +224,7 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Erro interno.' });
 });
 
-app.listen(PORT, () => console.log(`[capes] rodando na porta ${PORT}`));
+const server = app.listen(PORT, () => console.log(`[capes] rodando na porta ${PORT}`));
+
+// WebSocket dos jogos multiplayer (PingPong 1v1 etc.) em /ws
+require('./duel').attach(server);
