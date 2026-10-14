@@ -59,6 +59,7 @@
     image-rendering: pixelated;
   }
   .pv img { width: 120px; height: auto; }
+  .pv img#pvGif { width: 180px; image-rendering: auto; }
   code {
     display: block; margin-top: 8px; padding: 10px; border-radius: 8px; background: #0f1118;
     border: 1px dashed var(--accent); word-break: break-all; font-size: 13px; user-select: all;
@@ -74,9 +75,9 @@
   <label for="nick">Seu nick no Minecraft</label>
   <input id="nick" type="text" maxlength="16" placeholder="ex.: Steve" autocomplete="off" spellcheck="false">
 
-  <label for="file">Capa (PNG)</label>
-  <input id="file" type="file" accept="image/png">
-  <div class="hint">Aceita 64x32 (ou 128x64, 256x128...) e 22x17. Máx. 512 KB.</div>
+  <label for="file">Capa (PNG ou GIF)</label>
+  <input id="file" type="file" accept="image/png,image/gif">
+  <div class="hint">PNG 64x32 até 2048x1024 (proporção 2:1) ou 22x17. GIF animado até 480x480 (máx. 100 quadros). Máx. 8 MB.</div>
 
   <div id="tokenBox" class="hidden">
     <label for="token">Chave de edição</label>
@@ -87,6 +88,7 @@
   <div class="previews">
     <div class="pv hidden" id="pvBackWrap"><canvas id="pvBack" width="120" height="192"></canvas>Costas (nova)</div>
     <div class="pv hidden" id="pvSheetWrap"><canvas id="pvSheet" width="256" height="128"></canvas>Textura</div>
+    <div class="pv hidden" id="pvGifWrap"><img id="pvGif" alt="Prévia do GIF">GIF (nova)</div>
     <div class="pv hidden" id="pvCurrentWrap"><img id="pvCurrent" alt="Capa atual">Capa atual</div>
   </div>
 
@@ -107,7 +109,13 @@
   const $ = (id) => document.getElementById(id);
   const NICK_RE = /^[A-Za-z0-9_]{1,16}$/;
   const STORE_KEY = 'obscureCapeTokens';
-  let sheet = null; // canvas pronto para enviar
+  const MAX_BYTES = 8 * 1024 * 1024; // igual ao servidor
+  const PNG_MAX_W = 2048;
+  const GIF_MAX = 480;
+
+  let sheet = null;   // canvas PNG pronto para enviar
+  let gifFile = null; // File de GIF, enviado como esta (recodificar perderia a animacao)
+  let gifUrl = null;
 
   const tokens = {
     all() { try { return JSON.parse(localStorage.getItem(STORE_KEY) || '{}'); } catch { return {}; } },
@@ -125,7 +133,7 @@
   const nick = () => $('nick').value.trim();
   const show = (id, on) => $(id).classList.toggle('hidden', !on);
 
-  // Converte a imagem para o formato aceito (22x17 -> 64x32).
+  // Converte a imagem PNG para o formato aceito (22x17 -> 64x32).
   function normalize(img) {
     const w = img.naturalWidth, h = img.naturalHeight;
     const c = document.createElement('canvas');
@@ -134,12 +142,12 @@
       c.getContext('2d').drawImage(img, 0, 0);
       return c;
     }
-    if (w >= 64 && w <= 1024 && w % 64 === 0 && h === w / 2) {
+    if (w >= 64 && w <= PNG_MAX_W && w % 64 === 0 && h === w / 2) {
       c.width = w; c.height = h;
       c.getContext('2d').drawImage(img, 0, 0);
       return c;
     }
-    throw new Error(`Tamanho ${w}x${h} não suportado. Use 64x32 (ou 128x64, 256x128...) ou 22x17.`);
+    throw new Error(`Tamanho ${w}x${h} não suportado. Use 64x32 (ou 128x64, 256x128... até ${PNG_MAX_W}x${PNG_MAX_W / 2}), 22x17, ou um GIF até ${GIF_MAX}x${GIF_MAX}.`);
   }
 
   function drawPreview(c) {
@@ -158,13 +166,36 @@
     show('pvSheetWrap', true);
   }
 
-  $('file').addEventListener('change', () => {
+  function clearPreviews() {
     sheet = null;
+    gifFile = null;
+    if (gifUrl) { URL.revokeObjectURL(gifUrl); gifUrl = null; }
     show('pvBackWrap', false);
     show('pvSheetWrap', false);
+    show('pvGifWrap', false);
+  }
+
+  $('file').addEventListener('change', async () => {
+    clearPreviews();
     const f = $('file').files[0];
     if (!f) return;
-    if (f.size > 512 * 1024) return status('Arquivo grande demais (máx. 512 KB).', 'err');
+    if (f.size > MAX_BYTES) return status('Arquivo grande demais (máx. 8 MB).', 'err');
+
+    // descobre o tipo pelos bytes: "GIF8" + dimensoes (uint16 little-endian)
+    const head = new Uint8Array(await f.slice(0, 10).arrayBuffer());
+    const sig = String.fromCharCode(...head.slice(0, 6));
+    if (sig === 'GIF87a' || sig === 'GIF89a') {
+      const w = head[6] | (head[7] << 8), h = head[8] | (head[9] << 8);
+      if (w < 1 || h < 1 || w > GIF_MAX || h > GIF_MAX) {
+        return status(`GIF ${w}x${h} não suportado (máx. ${GIF_MAX}x${GIF_MAX}).`, 'err');
+      }
+      gifFile = f;
+      gifUrl = URL.createObjectURL(f);
+      $('pvGif').src = gifUrl;
+      show('pvGifWrap', true);
+      return status('');
+    }
+
     const url = URL.createObjectURL(f);
     const img = new Image();
     img.onload = () => {
@@ -189,7 +220,7 @@
       const r = await fetch(`/api/cape/${encodeURIComponent(n)}`);
       const j = await r.json();
       if (j.exists) {
-        $('pvCurrent').src = `/cape/${n.toLowerCase()}.png?t=${j.updatedAt}`;
+        $('pvCurrent').src = `${j.url}?t=${j.updatedAt}`;
         show('pvCurrentWrap', true);
         show('tokenBox', true);
       } else {
@@ -205,14 +236,15 @@
   $('send').addEventListener('click', async () => {
     const n = nick();
     if (!NICK_RE.test(n)) return status('Nick inválido (1-16 letras, números ou _).', 'err');
-    if (!sheet) return status('Escolha um arquivo PNG válido.', 'err');
+    if (!sheet && !gifFile) return status('Escolha um arquivo PNG ou GIF válido.', 'err');
 
     $('send').disabled = true;
     status('Enviando... (se o servidor estava dormindo, pode levar alguns segundos)');
     try {
-      const blob = await new Promise((res) => sheet.toBlob(res, 'image/png'));
+      const blob = gifFile || (await new Promise((res) => sheet.toBlob(res, 'image/png')));
+      if (blob.size > MAX_BYTES) return status('Arquivo grande demais (máx. 8 MB).', 'err');
       const key = $('token').value.trim() || tokens.get(n);
-      const headers = { 'Content-Type': 'image/png' };
+      const headers = { 'Content-Type': gifFile ? 'image/gif' : 'image/png' };
       if (key) headers['x-token'] = key;
 
       const r = await fetch(`/api/cape/${encodeURIComponent(n)}`, { method: 'POST', headers, body: blob });
