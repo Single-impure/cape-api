@@ -1,9 +1,11 @@
 'use strict';
 
 /**
- * Relay WebSocket para os jogos multiplayer do client (PingPong 1v1 e Football).
+ * Relay WebSocket para os jogos multiplayer do client (PingPong 1v1, Football, Volei)
+ * e para o chat global.
  *
  * Uma "sala" = jogo + servidor Minecraft (ex.: "pingpong|play.exemplo.com").
+ * O chat global usa uma sala unica ("chat|global"), compartilhada por todos os usuarios do client.
  *
  * pingpong: cada sala tem no maximo UMA mesa; o dono roda a fisica e as regras e manda o
  *   estado; so o convidado (join) manda "hit"; os demais sao espectadores.
@@ -14,6 +16,9 @@
  *   - kick/hold : qualquer jogador interage com a bola de outro; vai so ao dono da bola.
  *   - gscore    : o dono da bola avisa a todos que fez gol (confete + mensagem).
  *   - gone      : o servidor avisa quando alguem sai (some o gol e a bola dele).
+ *
+ * chat: o client manda { t: 'msg', text }; o servidor sanitiza e repassa
+ *   { t: 'msg', who, text } a todos da sala (inclusive ao autor).
  *
  * O servidor NAO simula nada: valida formato/faixas e repassa as mensagens.
  */
@@ -26,6 +31,10 @@ const GAME_RE = /^[a-z0-9_]{1,16}$/;
 
 const MAX_CONN_PER_IP = 8;
 const MAX_MSG_PER_SEC = 90;
+
+// chat global
+const MAX_CHAT_LEN = 200;
+const CHAT_COOLDOWN_MS = 800;
 
 // faixas aceitas (nome -> [min, max])
 const TABLE_SPEC = {
@@ -71,11 +80,13 @@ const VHIT_SPEC = { dx: [-2, 2], dy: [-2, 2], dz: [-2, 2], sp: [0, 60], px: [-3e
  *  guestMode    - (mesa) true: existe 1 convidado (join/leave) e so ele manda toOwner
  *  toOwner      - (mesa) mensagens que os clients mandam so ao dono (o servidor anexa "from")
  *  world        - true: jogo sem dono unico (cada jogador tem seu gol e sua bola)
+ *  chat         - true: sala de chat (so repassa texto sanitizado)
  */
 const GAMES = {
   pingpong: { open: TABLE_SPEC, state: STATE_SPEC, guestMode: true, toOwner: { hit: HIT_SPEC }, events: {} },
   football: { world: true },
   volei: { open: COURT_SPEC, state: VSTATE_SPEC, guestMode: false, toOwner: { hit: VHIT_SPEC }, events: {} },
+  chat: { chat: true },
 };
 const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 
@@ -176,7 +187,7 @@ function attach(httpServer) {
     // o cleanup pode ter removido a sala (ficou vazia): registra de novo
     if (!rooms.has(key)) rooms.set(key, room);
 
-    ws.meta = { name, key, id: String(nextId++), game, dead: false };
+    ws.meta = { name, key, id: String(nextId++), game, dead: false, lastChat: 0 };
     room.clients.add(ws);
     send(ws, { t: 'welcome', id: ws.meta.id, n: room.clients.size, ...tableInfo(room) });
 
@@ -185,6 +196,18 @@ function attach(httpServer) {
       for (const [n, d] of room.world.goals) send(ws, { t: 'gset', who: n, ...d });
       for (const [n, d] of room.world.balls) send(ws, { t: 'ball', who: n, ...d });
     }
+  }
+
+  /** Chat global: so repassa texto sanitizado a todos da sala. */
+  function onChatMessage(ws, room, msg) {
+    if (msg.t !== 'msg' || typeof msg.text !== 'string') return;
+    // remove controles e o caractere de formatacao (§) pra ninguem injetar cor/estilo
+    const text = msg.text.replace(/[\u0000-\u001f\u007f\u00a7]/g, '').trim().slice(0, MAX_CHAT_LEN);
+    if (!text) return;
+    const now = Date.now();
+    if (now - (ws.meta.lastChat || 0) < CHAT_COOLDOWN_MS) return send(ws, { t: 'error', m: 'devagar' });
+    ws.meta.lastChat = now;
+    broadcast(room, { t: 'msg', who: ws.meta.name, text });
   }
 
   /** Football: gol e bola por jogador. */
@@ -238,6 +261,7 @@ function attach(httpServer) {
     const cfg = GAMES[ws.meta.game];
 
     if (msg.t === 'ping') return send(ws, { t: 'pong' });
+    if (cfg.chat) return onChatMessage(ws, room, msg);
     if (cfg.world) return onWorldMessage(ws, room, msg);
 
     switch (msg.t) {
