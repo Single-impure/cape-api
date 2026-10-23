@@ -1,8 +1,8 @@
 'use strict';
 
 /**
- * Relay WebSocket para os jogos multiplayer do client (PingPong 1v1, Football, Volei)
- * e para o chat global.
+ * Relay WebSocket para os jogos multiplayer do client (PingPong 1v1, Football, Volei,
+ * Basquete, Boliche) e para o chat global.
  *
  * Uma "sala" = jogo + servidor Minecraft (ex.: "pingpong|play.exemplo.com").
  * O chat global usa uma sala unica ("chat|global"), compartilhada por todos os usuarios do client.
@@ -74,17 +74,47 @@ const VSTATE_SPEC = {
 };
 const VHIT_SPEC = { dx: [-2, 2], dy: [-2, 2], dz: [-2, 2], sp: [0, 60], px: [-3e7, 3e7], pz: [-3e7, 3e7] };
 
+// basquete (mesmo modelo do football: cada jogador tem 1 cesta e 1 bola)
+const HOOP_SPEC = {
+  ox: [-3e7, 3e7], oz: [-3e7, 3e7], fx: [-1.01, 1.01], fz: [-1.01, 1.01],
+  fy: [-64, 512], dim: [-10, 10], hh: [2, 6], rr: [0.15, 0.8],
+};
+const BSCORE_SPEC = { gx: [-3e7, 3e7], gy: [-100, 600], gz: [-3e7, 3e7], pts: [0, 9] };
+
+// boliche (cada jogador tem 1 pista; o dono simula tudo e manda o estado completo: bola + 10 pinos + placar)
+const BOWL_LANE_SPEC = {
+  ox: [-3e7, 3e7], oz: [-3e7, 3e7], fx: [-1.01, 1.01], fz: [-1.01, 1.01],
+  fy: [-64, 512], dim: [-10, 10], lw: [0.8, 8], ll: [4, 40], ps: [0.5, 3],
+};
+const BOWL_STATE_SPEC = {
+  bx: [-3e7, 3e7], by: [-100, 600], bz: [-3e7, 3e7],
+  vx: [-200, 200], vy: [-200, 200], vz: [-200, 200],
+  on: [0, 1], dim: [-10, 10], br: [0.04, 0.6],
+  fr: [0, 10], sc: [0, 300], ph: [0, 4],
+};
+for (let i = 0; i < 10; i++) {
+  BOWL_STATE_SPEC[`p${i}u`] = [-30, 30];
+  BOWL_STATE_SPEC[`p${i}v`] = [-30, 80];
+  BOWL_STATE_SPEC[`p${i}s`] = [0, 3];
+  BOWL_STATE_SPEC[`p${i}a`] = [-7, 7];
+}
+// evento: pts 1 = strike, 2 = spare, 10 + placar = fim de partida
+const BOWL_SCORE_SPEC = { gx: [-3e7, 3e7], gy: [-100, 600], gz: [-3e7, 3e7], pts: [0, 400] };
+
 /**
  * Config por jogo:
  *  open/state   - (mesa) campos aceitos ao abrir a mesa / no estado do dono
  *  guestMode    - (mesa) true: existe 1 convidado (join/leave) e so ele manda toOwner
  *  toOwner      - (mesa) mensagens que os clients mandam so ao dono (o servidor anexa "from")
- *  world        - true: jogo sem dono unico (cada jogador tem seu gol e sua bola)
+ *  world        - jogo sem dono unico (cada jogador tem seu gol e sua bola); guarda as specs
+ *                 { goal, ball, kick, hold, score } de cada jogo
  *  chat         - true: sala de chat (so repassa texto sanitizado)
  */
 const GAMES = {
   pingpong: { open: TABLE_SPEC, state: STATE_SPEC, guestMode: true, toOwner: { hit: HIT_SPEC }, events: {} },
-  football: { world: true },
+  football: { world: { goal: GOAL_SPEC, ball: BALL_SPEC, kick: KICK_SPEC, hold: HOLD_SPEC, score: SCORE_SPEC } },
+  basquete: { world: { goal: HOOP_SPEC, ball: BALL_SPEC, kick: KICK_SPEC, hold: HOLD_SPEC, score: BSCORE_SPEC } },
+  boliche: { world: { goal: BOWL_LANE_SPEC, ball: BOWL_STATE_SPEC, kick: KICK_SPEC, hold: HOLD_SPEC, score: BOWL_SCORE_SPEC } },
   volei: { open: COURT_SPEC, state: VSTATE_SPEC, guestMode: false, toOwner: { hit: VHIT_SPEC }, events: {} },
   chat: { chat: true },
 };
@@ -191,7 +221,7 @@ function attach(httpServer) {
     room.clients.add(ws);
     send(ws, { t: 'welcome', id: ws.meta.id, n: room.clients.size, ...tableInfo(room) });
 
-    // football: manda a quem entrou os gols e as bolas que ja existem
+    // football/basquete/boliche: manda a quem entrou os gols e as bolas que ja existem
     if (room.world) {
       for (const [n, d] of room.world.goals) send(ws, { t: 'gset', who: n, ...d });
       for (const [n, d] of room.world.balls) send(ws, { t: 'ball', who: n, ...d });
@@ -210,14 +240,15 @@ function attach(httpServer) {
     broadcast(room, { t: 'msg', who: ws.meta.name, text });
   }
 
-  /** Football: gol e bola por jogador. */
+  /** Jogos "world" (football, basquete, boliche): gol/cesta/pista e bola por jogador. */
   function onWorldMessage(ws, room, msg) {
     const name = ws.meta.name;
     const w = room.world;
+    const spec = GAMES[ws.meta.game].world;
 
     switch (msg.t) {
       case 'gset': {
-        const d = pick(msg, GOAL_SPEC);
+        const d = pick(msg, spec.goal);
         if (!d || Math.abs(d.fx * d.fx + d.fz * d.fz - 1) > 0.05) return send(ws, { t: 'error', m: 'gol-invalido' });
         w.goals.set(name, d);
         return broadcast(room, { t: 'gset', who: name, ...d }, ws);
@@ -228,7 +259,7 @@ function attach(httpServer) {
         return;
 
       case 'ball': {
-        const d = pick(msg, BALL_SPEC);
+        const d = pick(msg, spec.ball);
         if (!d) return;
         w.balls.set(name, d);
         return broadcast(room, { t: 'ball', who: name, ...d }, ws);
@@ -238,13 +269,13 @@ function attach(httpServer) {
       case 'hold': {
         const target = typeof msg.to === 'string' && NAME_RE.test(msg.to) ? findClient(room, msg.to) : null;
         if (!target || target === ws) return;
-        const d = pick(msg, msg.t === 'kick' ? KICK_SPEC : HOLD_SPEC);
+        const d = pick(msg, msg.t === 'kick' ? spec.kick : spec.hold);
         if (d) send(target, { t: msg.t, from: name, ...d });
         return;
       }
 
       case 'gscore': {
-        const d = pick(msg, SCORE_SPEC);
+        const d = pick(msg, spec.score);
         if (!d) return;
         broadcast(room, { t: 'gscore', who: name, by: okName(msg.by), gown: okName(msg.gown), ...d }, ws);
         return;

@@ -75,9 +75,9 @@
   <label for="nick">Seu nick no Minecraft</label>
   <input id="nick" type="text" maxlength="16" placeholder="ex.: Steve" autocomplete="off" spellcheck="false">
 
-  <label for="file">Capa (PNG ou GIF)</label>
-  <input id="file" type="file" accept="image/png,image/gif">
-  <div class="hint">PNG 64x32 até 2048x1024 (proporção 2:1) ou 22x17. GIF animado até 480x480 (máx. 100 quadros). Máx. 8 MB.</div>
+  <label for="file">Capa (PNG, GIF ou JPG)</label>
+  <input id="file" type="file" accept="image/png,image/gif,image/jpeg">
+  <div class="hint">Qualquer resolução até 4096x4096. PNG 2:1 (64x32, 1024x512...) vira layout de capa; outras proporções são encaixadas na capa. GIF animado até 200 quadros. Máx. 16 MB.</div>
 
   <div id="tokenBox" class="hidden">
     <label for="token">Chave de edição</label>
@@ -88,7 +88,7 @@
   <div class="previews">
     <div class="pv hidden" id="pvBackWrap"><canvas id="pvBack" width="120" height="192"></canvas>Costas (nova)</div>
     <div class="pv hidden" id="pvSheetWrap"><canvas id="pvSheet" width="256" height="128"></canvas>Textura</div>
-    <div class="pv hidden" id="pvGifWrap"><img id="pvGif" alt="Prévia do GIF">GIF (nova)</div>
+    <div class="pv hidden" id="pvGifWrap"><img id="pvGif" alt="Prévia da imagem">Prévia (nova)</div>
     <div class="pv hidden" id="pvCurrentWrap"><img id="pvCurrent" alt="Capa atual">Capa atual</div>
   </div>
 
@@ -109,12 +109,12 @@
   const $ = (id) => document.getElementById(id);
   const NICK_RE = /^[A-Za-z0-9_]{1,16}$/;
   const STORE_KEY = 'obscureCapeTokens';
-  const MAX_BYTES = 8 * 1024 * 1024; // igual ao servidor
-  const PNG_MAX_W = 2048;
-  const GIF_MAX = 480;
+  const MAX_BYTES = 16 * 1024 * 1024; // igual ao servidor
+  const MAX_DIM = 4096;
 
-  let sheet = null;   // canvas PNG pronto para enviar
-  let gifFile = null; // File de GIF, enviado como esta (recodificar perderia a animacao)
+  let sheet = null;    // canvas PNG (so para 22x17 -> 64x32)
+  let rawFile = null;  // arquivo enviado como esta (PNG/JPG/GIF)
+  let rawType = '';
   let gifUrl = null;
 
   const tokens = {
@@ -133,21 +133,12 @@
   const nick = () => $('nick').value.trim();
   const show = (id, on) => $(id).classList.toggle('hidden', !on);
 
-  // Converte a imagem PNG para o formato aceito (22x17 -> 64x32).
+  // So o formato 22x17 precisa de conversao (-> 64x32). O resto vai como esta.
   function normalize(img) {
-    const w = img.naturalWidth, h = img.naturalHeight;
     const c = document.createElement('canvas');
-    if (w === 22 && h === 17) {
-      c.width = 64; c.height = 32;
-      c.getContext('2d').drawImage(img, 0, 0);
-      return c;
-    }
-    if (w >= 64 && w <= PNG_MAX_W && w % 64 === 0 && h === w / 2) {
-      c.width = w; c.height = h;
-      c.getContext('2d').drawImage(img, 0, 0);
-      return c;
-    }
-    throw new Error(`Tamanho ${w}x${h} não suportado. Use 64x32 (ou 128x64, 256x128... até ${PNG_MAX_W}x${PNG_MAX_W / 2}), 22x17, ou um GIF até ${GIF_MAX}x${GIF_MAX}.`);
+    c.width = 64; c.height = 32;
+    c.getContext('2d').drawImage(img, 0, 0);
+    return c;
   }
 
   function drawPreview(c) {
@@ -168,7 +159,8 @@
 
   function clearPreviews() {
     sheet = null;
-    gifFile = null;
+    rawFile = null;
+    rawType = '';
     if (gifUrl) { URL.revokeObjectURL(gifUrl); gifUrl = null; }
     show('pvBackWrap', false);
     show('pvSheetWrap', false);
@@ -179,34 +171,46 @@
     clearPreviews();
     const f = $('file').files[0];
     if (!f) return;
-    if (f.size > MAX_BYTES) return status('Arquivo grande demais (máx. 8 MB).', 'err');
+    if (f.size > MAX_BYTES) return status('Arquivo grande demais (máx. 16 MB).', 'err');
 
-    // descobre o tipo pelos bytes: "GIF8" + dimensoes (uint16 little-endian)
     const head = new Uint8Array(await f.slice(0, 10).arrayBuffer());
     const sig = String.fromCharCode(...head.slice(0, 6));
-    if (sig === 'GIF87a' || sig === 'GIF89a') {
+    const isGif = sig === 'GIF87a' || sig === 'GIF89a';
+    const isPng = head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47;
+    const isJpg = head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff;
+
+    if (isGif) {
       const w = head[6] | (head[7] << 8), h = head[8] | (head[9] << 8);
-      if (w < 1 || h < 1 || w > GIF_MAX || h > GIF_MAX) {
-        return status(`GIF ${w}x${h} não suportado (máx. ${GIF_MAX}x${GIF_MAX}).`, 'err');
+      if (w < 1 || h < 1 || w > MAX_DIM || h > MAX_DIM) {
+        return status(`GIF ${w}x${h} não suportado (máx. ${MAX_DIM}x${MAX_DIM}).`, 'err');
       }
-      gifFile = f;
+      rawFile = f; rawType = 'image/gif';
       gifUrl = URL.createObjectURL(f);
       $('pvGif').src = gifUrl;
       show('pvGifWrap', true);
       return status('');
     }
+    if (!isPng && !isJpg) return status('Formato não suportado. Use PNG, GIF ou JPG.', 'err');
 
     const url = URL.createObjectURL(f);
     const img = new Image();
     img.onload = () => {
-      URL.revokeObjectURL(url);
-      try {
+      const w = img.naturalWidth, h = img.naturalHeight;
+      if (w > MAX_DIM || h > MAX_DIM) {
+        URL.revokeObjectURL(url);
+        return status(`Imagem ${w}x${h} grande demais (máx. ${MAX_DIM}x${MAX_DIM}).`, 'err');
+      }
+      if (isPng && w === 22 && h === 17) {
+        URL.revokeObjectURL(url);
         sheet = normalize(img);
         drawPreview(sheet);
-        status('');
-      } catch (e) {
-        status(e.message, 'err');
+      } else {
+        rawFile = f; rawType = isPng ? 'image/png' : 'image/jpeg';
+        gifUrl = url; // mantem a URL viva para a previa
+        $('pvGif').src = url;
+        show('pvGifWrap', true);
       }
+      status('');
     };
     img.onerror = () => { URL.revokeObjectURL(url); status('Não consegui ler essa imagem.', 'err'); };
     img.src = url;
@@ -236,15 +240,15 @@
   $('send').addEventListener('click', async () => {
     const n = nick();
     if (!NICK_RE.test(n)) return status('Nick inválido (1-16 letras, números ou _).', 'err');
-    if (!sheet && !gifFile) return status('Escolha um arquivo PNG ou GIF válido.', 'err');
+    if (!sheet && !rawFile) return status('Escolha um arquivo PNG, GIF ou JPG válido.', 'err');
 
     $('send').disabled = true;
     status('Enviando... (se o servidor estava dormindo, pode levar alguns segundos)');
     try {
-      const blob = gifFile || (await new Promise((res) => sheet.toBlob(res, 'image/png')));
-      if (blob.size > MAX_BYTES) return status('Arquivo grande demais (máx. 8 MB).', 'err');
+      const blob = rawFile || (await new Promise((res) => sheet.toBlob(res, 'image/png')));
+      if (blob.size > MAX_BYTES) return status('Arquivo grande demais (máx. 16 MB).', 'err');
       const key = $('token').value.trim() || tokens.get(n);
-      const headers = { 'Content-Type': gifFile ? 'image/gif' : 'image/png' };
+      const headers = { 'Content-Type': rawFile ? rawType : 'image/png' };
       if (key) headers['x-token'] = key;
 
       const r = await fetch(`/api/cape/${encodeURIComponent(n)}`, { method: 'POST', headers, body: blob });
