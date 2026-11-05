@@ -1,27 +1,19 @@
 'use strict';
 
 /**
- * Contas (criadas so pelo admin), HWID e sessoes. Tudo no Postgres.
+ * Contas (criadas so pelo admin), HWID e sessoes. Banco: Turso (libSQL/SQLite).
  *  - senha: scrypt com sal (nunca guardada em texto)
  *  - sessao: token aleatorio de 256 bits, so o hash fica no banco, preso ao HWID
  *  - HWID: o client manda um hash; o servidor guarda o hash dele de novo
+ *  - datas: milissegundos (inteiro)
  */
 
 const crypto = require('crypto');
 const { promisify } = require('util');
 const { EventEmitter } = require('events');
-const { Pool } = require('pg');
+const db = require('./db');
 
 const scrypt = promisify(crypto.scrypt);
-
-if (!process.env.DATABASE_URL) {
-  throw new Error('DATABASE_URL e obrigatoria para o sistema de contas (Postgres).');
-}
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.PGSSL === 'false' ? false : { rejectUnauthorized: false },
-});
 
 /** 'kick' (username): o duel.js derruba os WebSockets dessa conta. */
 const events = new EventEmitter();
@@ -30,9 +22,11 @@ const USER_RE = /^[A-Za-z0-9_]{3,16}$/;
 const HEX64 = /^[0-9a-f]{64}$/;
 const TOKEN_RE = /^[0-9a-f]{64}$/;
 const SESSION_MS = 12 * 3600 * 1000;
+const DAY_MS = 86400000;
 const MAX_FAILS = 5;
 const LOCK_MS = 15 * 60 * 1000;
 
+const q = (sql, args = []) => db.execute({ sql, args });
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 function safeEq(a, b) {
   const x = Buffer.from(String(a));
@@ -55,30 +49,34 @@ async function verifyPassword(pw, stored) {
 let DUMMY_HASH = null; // usado quando o usuario nao existe (mesmo tempo de resposta)
 
 const ready = (async () => {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id          BIGSERIAL PRIMARY KEY,
-      username    TEXT NOT NULL,
-      username_lc TEXT UNIQUE NOT NULL,
-      pass_hash   TEXT NOT NULL,
-      hwid_hash   TEXT,
-      expires_at  TIMESTAMPTZ,
-      banned      BOOLEAN NOT NULL DEFAULT false,
-      created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-      last_login  TIMESTAMPTZ
-    )`);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS sessions (
-      token_hash TEXT PRIMARY KEY,
-      user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      hwid_hash  TEXT NOT NULL,
-      expires_at TIMESTAMPTZ NOT NULL
-    )`);
+  await db.batch(
+    [
+      `CREATE TABLE IF NOT EXISTS users (
+         id          INTEGER PRIMARY KEY AUTOINCREMENT,
+         username    TEXT NOT NULL,
+         username_lc TEXT NOT NULL UNIQUE,
+         pass_hash   TEXT NOT NULL,
+         hwid_hash   TEXT,
+         expires_at  INTEGER,
+         banned      INTEGER NOT NULL DEFAULT 0,
+         created_at  INTEGER NOT NULL,
+         last_login  INTEGER
+       )`,
+      `CREATE TABLE IF NOT EXISTS sessions (
+         token_hash TEXT PRIMARY KEY,
+         user_id    INTEGER NOT NULL,
+         hwid_hash  TEXT NOT NULL,
+         expires_at INTEGER NOT NULL
+       )`,
+      `CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id)`,
+    ],
+    'write'
+  );
   DUMMY_HASH = await hashPassword('dummy-password-for-timing');
 })();
 
 setInterval(() => {
-  pool.query('DELETE FROM sessions WHERE expires_at < now()').catch(() => {});
+  q('DELETE FROM sessions WHERE expires_at < ?', [Date.now()]).catch(() => {});
 }, 3600_000).unref();
 
 // ───────────── Usuario ─────────────
@@ -91,14 +89,13 @@ async function createUser(username, password, days) {
   if (!password) password = generated = crypto.randomBytes(9).toString('base64url');
   if (password.length < 8 || password.length > 128) return { status: 400, error: 'A senha precisa ter de 8 a 128 caracteres.' };
   const passHash = await hashPassword(password);
+  const now = Date.now();
   try {
-    await pool.query(
-      `INSERT INTO users (username, username_lc, pass_hash, expires_at)
-       VALUES ($1, $2, $3, CASE WHEN $4::int IS NULL THEN NULL ELSE now() + make_interval(days => $4::int) END)`,
-      [username, username.toLowerCase(), passHash, days]
-    );
+    await q('INSERT INTO users (username, username_lc, pass_hash, expires_at, created_at) VALUES (?,?,?,?,?)', [
+      username, username.toLowerCase(), passHash, days ? now + days * DAY_MS : null, now,
+    ]);
   } catch (e) {
-    if (e.code === '23505') return { status: 409, error: 'Esse usuario ja existe.' };
+    if (/UNIQUE/i.test(String(e && e.message))) return { status: 409, error: 'Esse usuario ja existe.' };
     throw e;
   }
   return { ok: true, password: generated }; // password so vem preenchida se foi gerada
@@ -118,12 +115,13 @@ async function login(username, password, hwid) {
     return { status: 429, error: 'Muitas tentativas. Tente de novo em alguns minutos.' };
   }
 
-  const r = await pool.query('SELECT * FROM users WHERE username_lc = $1', [lc]);
+  const r = await q('SELECT * FROM users WHERE username_lc = ?', [lc]);
   const u = r.rows[0];
   const okPw = await verifyPassword(password, u ? u.pass_hash : DUMMY_HASH);
   if (!u || !okPw) {
     if (u) {
-      const n = (f && f.until <= Date.now() ? 0 : f ? f.n : 0) + 1;
+      const expired = f && f.until !== 0 && f.until <= Date.now(); // bloqueio antigo ja venceu
+      const n = (f && !expired ? f.n : 0) + 1;
       fails.set(lc, { n, until: n >= MAX_FAILS ? Date.now() + LOCK_MS : 0 });
     }
     return generic;
@@ -131,34 +129,30 @@ async function login(username, password, hwid) {
   fails.delete(lc);
 
   if (u.banned) return { status: 403, error: 'Conta banida.' };
-  if (u.expires_at && new Date(u.expires_at).getTime() < Date.now()) {
-    return { status: 403, error: 'Licenca expirada.' };
-  }
+  if (u.expires_at != null && u.expires_at < Date.now()) return { status: 403, error: 'Licenca expirada.' };
 
   const hw = sha256(hwid);
   if (!u.hwid_hash) {
-    await pool.query('UPDATE users SET hwid_hash = $1 WHERE id = $2 AND hwid_hash IS NULL', [hw, u.id]);
+    await q('UPDATE users SET hwid_hash = ? WHERE id = ? AND hwid_hash IS NULL', [hw, u.id]);
   } else if (!safeEq(hw, u.hwid_hash)) {
     return { status: 403, error: 'Este PC nao e o registrado na conta. Peca o reset de HWID ao admin.' };
   }
 
   // uma sessao por conta (impede compartilhar login)
   events.emit('kick', u.username);
-  await pool.query('DELETE FROM sessions WHERE user_id = $1', [u.id]);
+  await q('DELETE FROM sessions WHERE user_id = ?', [u.id]);
   const token = crypto.randomBytes(32).toString('hex');
   let exp = Date.now() + SESSION_MS;
-  if (u.expires_at) exp = Math.min(exp, new Date(u.expires_at).getTime());
-  await pool.query('INSERT INTO sessions (token_hash, user_id, hwid_hash, expires_at) VALUES ($1,$2,$3,$4)', [
-    sha256(token), u.id, hw, new Date(exp),
-  ]);
-  await pool.query('UPDATE users SET last_login = now() WHERE id = $1', [u.id]);
+  if (u.expires_at != null) exp = Math.min(exp, u.expires_at);
+  await q('INSERT INTO sessions (token_hash, user_id, hwid_hash, expires_at) VALUES (?,?,?,?)', [sha256(token), u.id, hw, exp]);
+  await q('UPDATE users SET last_login = ? WHERE id = ?', [Date.now(), u.id]);
 
   return {
     ok: true,
     token,
     username: u.username,
     expiresAt: exp,
-    daysLeft: u.expires_at ? Math.max(0, Math.ceil((new Date(u.expires_at).getTime() - Date.now()) / 86400000)) : -1,
+    daysLeft: u.expires_at != null ? Math.max(0, Math.ceil((u.expires_at - Date.now()) / DAY_MS)) : -1,
   };
 }
 
@@ -166,18 +160,17 @@ async function login(username, password, hwid) {
 async function validateSession(token, hwid) {
   await ready;
   if (typeof token !== 'string' || !TOKEN_RE.test(token) || typeof hwid !== 'string' || !HEX64.test(hwid)) return null;
-  const r = await pool.query(
+  const r = await q(
     `SELECT u.username, u.banned, u.expires_at AS lic, s.hwid_hash, s.expires_at AS sexp
        FROM sessions s JOIN users u ON u.id = s.user_id
-      WHERE s.token_hash = $1`,
+      WHERE s.token_hash = ?`,
     [sha256(token)]
   );
   const row = r.rows[0];
   if (!row || row.banned) return null;
-  const now = Date.now();
-  let exp = new Date(row.sexp).getTime();
-  if (row.lic) exp = Math.min(exp, new Date(row.lic).getTime());
-  if (exp <= now) return null;
+  let exp = row.sexp;
+  if (row.lic != null) exp = Math.min(exp, row.lic);
+  if (exp <= Date.now()) return null;
   if (!safeEq(sha256(hwid), row.hwid_hash)) return null;
   return { username: row.username, exp };
 }
@@ -185,7 +178,7 @@ async function validateSession(token, hwid) {
 async function logout(token) {
   await ready;
   if (typeof token === 'string' && TOKEN_RE.test(token)) {
-    await pool.query('DELETE FROM sessions WHERE token_hash = $1', [sha256(token)]);
+    await q('DELETE FROM sessions WHERE token_hash = ?', [sha256(token)]);
   }
 }
 
@@ -193,28 +186,28 @@ async function logout(token) {
 
 async function listUsers() {
   await ready;
-  const r = await pool.query(
+  const r = await q(
     `SELECT id, username, (hwid_hash IS NOT NULL) AS hwid_bound, expires_at, banned, created_at, last_login
        FROM users ORDER BY id DESC LIMIT 1000`
   );
-  return r.rows;
+  return r.rows.map((x) => ({ ...x })); // Row -> objeto simples (JSON)
 }
 
 async function resetHwid(id) {
   await ready;
-  const r = await pool.query('UPDATE users SET hwid_hash = NULL WHERE id = $1 RETURNING username', [id]);
-  if (!r.rowCount) return false;
-  await pool.query('DELETE FROM sessions WHERE user_id = $1', [id]);
+  const r = await q('UPDATE users SET hwid_hash = NULL WHERE id = ? RETURNING username', [id]);
+  if (!r.rows.length) return false;
+  await q('DELETE FROM sessions WHERE user_id = ?', [id]);
   events.emit('kick', r.rows[0].username);
   return true;
 }
 
 async function setBanned(id, banned) {
   await ready;
-  const r = await pool.query('UPDATE users SET banned = $2 WHERE id = $1 RETURNING username', [id, banned]);
-  if (!r.rowCount) return false;
+  const r = await q('UPDATE users SET banned = ? WHERE id = ? RETURNING username', [banned ? 1 : 0, id]);
+  if (!r.rows.length) return false;
   if (banned) {
-    await pool.query('DELETE FROM sessions WHERE user_id = $1', [id]);
+    await q('DELETE FROM sessions WHERE user_id = ?', [id]);
     events.emit('kick', r.rows[0].username);
   }
   return true;
@@ -222,18 +215,18 @@ async function setBanned(id, banned) {
 
 async function extend(id, days) {
   await ready;
-  const r = await pool.query(
-    `UPDATE users SET expires_at = GREATEST(expires_at, now()) + make_interval(days => $2)
-      WHERE id = $1 AND expires_at IS NOT NULL`,
-    [id, days]
+  const r = await q(
+    'UPDATE users SET expires_at = max(expires_at, ?) + ? WHERE id = ? AND expires_at IS NOT NULL',
+    [Date.now(), days * DAY_MS, id]
   );
-  return r.rowCount > 0;
+  return r.rowsAffected > 0;
 }
 
 async function deleteUser(id) {
   await ready;
-  const r = await pool.query('DELETE FROM users WHERE id = $1 RETURNING username', [id]); // sessoes saem por CASCADE
-  if (!r.rowCount) return false;
+  await q('DELETE FROM sessions WHERE user_id = ?', [id]);
+  const r = await q('DELETE FROM users WHERE id = ? RETURNING username', [id]);
+  if (!r.rows.length) return false;
   events.emit('kick', r.rows[0].username);
   return true;
 }
@@ -242,9 +235,9 @@ async function deleteUser(id) {
 async function resetPassword(id) {
   await ready;
   const pw = crypto.randomBytes(9).toString('base64url');
-  const r = await pool.query('UPDATE users SET pass_hash = $2 WHERE id = $1 RETURNING username', [id, await hashPassword(pw)]);
-  if (!r.rowCount) return null;
-  await pool.query('DELETE FROM sessions WHERE user_id = $1', [id]);
+  const r = await q('UPDATE users SET pass_hash = ? WHERE id = ? RETURNING username', [await hashPassword(pw), id]);
+  if (!r.rows.length) return null;
+  await q('DELETE FROM sessions WHERE user_id = ?', [id]);
   events.emit('kick', r.rows[0].username);
   fails.delete(r.rows[0].username.toLowerCase());
   return pw;

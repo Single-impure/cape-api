@@ -159,12 +159,17 @@ function createFileStore(dir) {
   };
 }
 
-const store = process.env.DATABASE_URL
-  ? createPgStore(process.env.DATABASE_URL)
-  : createFileStore(process.env.DATA_DIR || path.join(__dirname, 'data', 'capes'));
+const store = process.env.TURSO_DATABASE_URL
+  ? require('./capestore')(require('./db'))
+  : process.env.DATABASE_URL
+    ? createPgStore(process.env.DATABASE_URL)
+    : createFileStore(process.env.DATA_DIR || path.join(__dirname, 'data', 'capes'));
 
-console.log(process.env.DATABASE_URL ? '[capes] storage: Postgres' : '[capes] storage: disco local (dados somem em hosts efemeros!)');
+console.log(process.env.TURSO_DATABASE_URL ? '[capes] storage: Turso'
+  : process.env.DATABASE_URL ? '[capes] storage: Postgres'
+  : '[capes] storage: disco local (dados somem em hosts efemeros!)');
 
+  
 function parseNick(raw) {
   return NICK_RE.test(raw || '') ? raw.toLowerCase() : null;
 }
