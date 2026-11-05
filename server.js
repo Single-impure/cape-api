@@ -187,6 +187,9 @@ const writeLimiter = rateLimit({
 });
 
 app.get('/health', (req, res) => res.json({ ok: true }));
+const { authRouter, adminRouter } = require('./accounts');
+app.use('/api/auth', authRouter);
+app.use('/admin/api', adminRouter);
 
 // Download usado pelo client do jogo: /cape/<nick>.png, .gif ou .jpg
 // A extensao precisa bater com o tipo guardado.
